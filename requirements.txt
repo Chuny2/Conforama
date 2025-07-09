@@ -1,0 +1,7 @@
+"""
+Requirements file for Conforama Phone Extractor
+"""
+
+httpx>=0.24.0
+typing-extensions>=4.0.0
+PyQt5>=5.15.0
