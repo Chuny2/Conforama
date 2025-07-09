@@ -147,6 +147,7 @@ class ConforamaGUI(QMainWindow):
         self.thread_spinbox = QSpinBox()
         self.thread_spinbox.setRange(1, config.MAX_WORKERS_LIMIT)
         self.thread_spinbox.setValue(config.DEFAULT_MAX_WORKERS)
+        self.thread_spinbox.setToolTip("Number of concurrent threads. Higher values = faster processing but more server load.\nRecommended: 10-50 for most cases.")
         settings_layout.addWidget(self.thread_spinbox, 0, 1)
         
         settings_group.setLayout(settings_layout)
@@ -264,6 +265,7 @@ class ConforamaGUI(QMainWindow):
         self.max_workers_spin = QSpinBox()
         self.max_workers_spin.setRange(1, config.MAX_WORKERS_LIMIT)
         self.max_workers_spin.setValue(config.DEFAULT_MAX_WORKERS)
+        self.max_workers_spin.setToolTip("Number of concurrent threads. Higher values = faster processing but more server load.\nRecommended: 10-50 for most cases.")
         advanced_layout.addWidget(self.max_workers_spin, 0, 1)
         
         self.mobile_only_check = QCheckBox("Mobile numbers only (6xxxxxxxx)")
@@ -376,14 +378,52 @@ class ConforamaGUI(QMainWindow):
             
             # Add phone to buffer for batch writing
             self.phone_buffer.append(result.phone)
+        elif result.banned:
+            self.results_table.setItem(row, 2, QTableWidgetItem("N/A"))
+            self.results_table.setItem(row, 3, QTableWidgetItem("🚫 BANNED"))
+            self.log_text.append(f"🚫 {result.username} -> BANNED (401)")
         else:
             self.results_table.setItem(row, 2, QTableWidgetItem("N/A"))
             self.results_table.setItem(row, 3, QTableWidgetItem(f"❌ {result.error}"))
             self.log_text.append(f"❌ {result.username} -> {result.error}")
         
+        # Update live statistics
+        self.update_live_stats(completed, total)
+        
         # Auto-scroll to bottom
         self.log_text.moveCursor(self.log_text.textCursor().End)
         self.results_table.scrollToBottom()
+    
+    def update_live_stats(self, completed: int, total: int):
+        """Update statistics in real-time"""
+        # Count results from table
+        successful = 0
+        failed = 0
+        banned = 0
+        
+        for i in range(self.results_table.rowCount()):
+            status_item = self.results_table.item(i, 3)
+            if status_item:
+                status = status_item.text()
+                if "✅" in status:
+                    successful += 1
+                elif "🚫" in status:
+                    banned += 1
+                else:
+                    failed += 1
+        
+        success_rate = (successful / completed * 100) if completed > 0 else 0
+        
+        stats_text = f"""
+📊 Live Statistics
+Progress: {completed}/{total} ({(completed/total*100):.1f}%)
+✅ Success: {successful}
+❌ Failed: {failed}
+🚫 Banned: {banned}
+Success rate: {success_rate:.1f}%
+        """
+        
+        self.stats_label.setText(stats_text)
     
     def on_extraction_finished(self, results: List[PhoneResult]):
         """Handle extraction completion"""
@@ -393,13 +433,15 @@ class ConforamaGUI(QMainWindow):
         
         # Update statistics
         successful = [r for r in results if r.success]
-        failed = [r for r in results if not r.success]
+        failed = [r for r in results if not r.success and not r.banned]
+        banned = [r for r in results if r.banned]
         
         stats_text = f"""
 📊 Extraction Complete!
 Total accounts: {len(results)}
 ✅ Success: {len(successful)}
 ❌ Failed: {len(failed)}
+🚫 Banned: {len(banned)}
 Success rate: {(len(successful)/len(results)*100):.1f}%
         """
         
@@ -411,11 +453,14 @@ Success rate: {(len(successful)/len(results)*100):.1f}%
         self.batch_write_phones()
         
         # Show completion message
+        completion_msg = f"Extraction completed!\n\n" \
+                        f"Found {len(successful)} phone numbers out of {len(results)} accounts.\n" \
+                        f"Banned accounts: {len(banned)}"
+        
         QMessageBox.information(
             self, 
             "Extraction Complete", 
-            f"Extraction completed!\n\n"
-            f"Found {len(successful)} phone numbers out of {len(results)} accounts."
+            completion_msg
         )
     
     def batch_write_phones(self):

@@ -17,13 +17,37 @@ class ConforamaSession:
             headers={
                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
                 "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate, br",
+                "Accept-Encoding": "gzip, deflate",  # Removed 'br' to avoid Brotli compression issues on Windows
                 "Upgrade-Insecure-Requests": "1",
                 "Sec-Fetch-Site": "same-origin",
                 "Te": "trailers"
             }
         )
         
+    def _get_decoded_content(self, response):
+        """Get properly decoded content with Brotli fallback handling"""
+        try:
+            # Try normal text decoding first
+            return response.text
+        except Exception:
+            # If normal decoding fails, try manual decompression
+            content_encoding = response.headers.get('content-encoding', '').lower()
+            
+            if content_encoding == 'br':
+                try:
+                    import brotli
+                    decompressed = brotli.decompress(response.content)
+                    return decompressed.decode('utf-8')
+                except ImportError:
+                    # Brotli module not available, use replacement decoding
+                    return response.content.decode('utf-8', errors='replace')
+                except Exception:
+                    # Brotli decompression failed, use replacement decoding
+                    return response.content.decode('utf-8', errors='replace')
+            else:
+                # Other encoding or no encoding, use replacement decoding
+                return response.content.decode('utf-8', errors='replace')
+    
     def get_login_page(self):
         """Get the login page to establish session"""
         login_page_url = "https://www.conforama.es/customer/account/login?returnUrl=%2Fsales%2Forder%2Fhistory"
@@ -38,6 +62,8 @@ class ConforamaSession:
         
         try:
             response = self.session.get(login_page_url, headers=headers)
+            if response.status_code == 401:
+                return "banned"
             return response.status_code == 200
         except Exception:
             return False
@@ -64,6 +90,8 @@ class ConforamaSession:
         
         try:
             response = self.session.post(login_url, headers=headers, data=form_data)
+            if response.status_code == 401:
+                return "banned"
             return "sales/order/history" in str(response.url)
         except Exception:
             return False
@@ -82,6 +110,8 @@ class ConforamaSession:
         
         try:
             response = self.session.get(order_history_url, headers=headers)
+            if response.status_code == 401:
+                return "banned"
             return response.status_code == 200
         except Exception:
             return False
@@ -101,8 +131,11 @@ class ConforamaSession:
         
         try:
             response = self.session.get(address_url, headers=headers)
+            if response.status_code == 401:
+                return "banned"
             if response.status_code == 200:
-                return self.extract_phone_number(response.text)
+                html_content = self._get_decoded_content(response)
+                return self.extract_phone_number(html_content)
             return None
         except Exception:
             return None

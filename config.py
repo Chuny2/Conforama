@@ -7,8 +7,8 @@ HTTP_TIMEOUT = 30.0
 FOLLOW_REDIRECTS = True
 
 # Threading Configuration
-DEFAULT_MAX_WORKERS = 3
-MAX_WORKERS_LIMIT = 10
+DEFAULT_MAX_WORKERS = 10
+MAX_WORKERS_LIMIT = 100  # Increased limit for high-volume processing
 
 # URL Configuration
 BASE_URL = "https://www.conforama.es"
