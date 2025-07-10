@@ -3,6 +3,7 @@ PyQt5 GUI Interface for Conforama Phone Extractor
 """
 
 import sys
+import platform
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QPushButton, QTextEdit, 
                             QProgressBar, QSpinBox, QFileDialog, QMessageBox,
@@ -18,6 +19,9 @@ from credential_manager import CredentialManager
 from phone_extractor import PhoneExtractor, PhoneResult
 import config
 
+# Detect Windows for CPU optimizations
+IS_WINDOWS = platform.system() == "Windows"
+
 
 class ExtractionWorker(QThread):
     progress_updated = pyqtSignal(object, int, int)
@@ -26,7 +30,7 @@ class ExtractionWorker(QThread):
     error_occurred = pyqtSignal(str)
     startup_progress = pyqtSignal(str)
     
-    def __init__(self, credentials, max_workers=3):
+    def __init__(self, credentials, max_workers=3, gui_update_batch_size=10, gui_update_interval=0.1):
         super().__init__()
         self.credentials = credentials
         self.max_workers = max_workers
@@ -37,6 +41,16 @@ class ExtractionWorker(QThread):
         self.result_batch = []
         self.last_update_time = 0
         self.batch_lock = threading.Lock()
+        
+        # GUI update settings (platform-specific)
+        if IS_WINDOWS:
+            # More conservative settings for Windows to reduce CPU usage
+            self.gui_update_batch_size = gui_update_batch_size * 2  # Larger batches
+            self.gui_update_interval = gui_update_interval * 1.5    # Longer intervals
+        else:
+            # Standard settings for Linux/other systems
+            self.gui_update_batch_size = gui_update_batch_size
+            self.gui_update_interval = gui_update_interval
     
     def run(self):
         try:
@@ -48,6 +62,12 @@ class ExtractionWorker(QThread):
             )
             
             self.startup_progress.emit("Starting staggered thread execution...")
+            
+            # For large datasets, show submission progress
+            if self.total_accounts > 10000:
+                self.startup_progress.emit(f"Submitting {self.total_accounts} tasks in batches...")
+            
+            self.startup_progress.emit("Extraction started - watching for first results...")
             
             self.extractor.process_accounts_threaded(self.credentials)
             
@@ -63,13 +83,31 @@ class ExtractionWorker(QThread):
             
         current_time = time.time()
         
+        # For real-time feedback, send more results immediately
+        if completed <= 200:
+            # First 200 results always immediate
+            self.batch_progress_updated.emit([(result, completed, total)], completed, total)
+            return
+        
+        # For large datasets, continue immediate updates longer for real-time logs
+        if total > 50000 and completed <= 1000:
+            self.batch_progress_updated.emit([(result, completed, total)], completed, total)
+            return
+        elif total > 10000 and completed <= 500:
+            self.batch_progress_updated.emit([(result, completed, total)], completed, total)
+            return
+        
         with self.batch_lock:
             self.result_batch.append((result, completed, total))
             
+            # More aggressive batching for real-time feedback
+            force_early_update = (completed <= 200) or (completed % 10 == 0)
+            
             should_update = (
-                len(self.result_batch) >= config.GUI_UPDATE_BATCH_SIZE or
-                current_time - self.last_update_time >= config.GUI_UPDATE_INTERVAL or
-                completed == total
+                len(self.result_batch) >= self.gui_update_batch_size or
+                current_time - self.last_update_time >= self.gui_update_interval or
+                completed == total or
+                force_early_update
             )
             
             if should_update:
@@ -105,9 +143,19 @@ class ConforamaGUI(QMainWindow):
         self.log_entries = []
         self.is_large_dataset = False
         
+        # Instance-specific GUI update settings (platform-aware)
+        if IS_WINDOWS:
+            # More conservative settings for Windows
+            self.gui_update_batch_size = config.GUI_UPDATE_BATCH_SIZE * 2
+            self.gui_update_interval = config.GUI_UPDATE_INTERVAL * 2
+        else:
+            # Standard settings for Linux/other systems
+            self.gui_update_batch_size = config.GUI_UPDATE_BATCH_SIZE
+            self.gui_update_interval = config.GUI_UPDATE_INTERVAL
+        
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.flush_pending_updates)
-        self.update_timer.start(int(config.GUI_UPDATE_INTERVAL * 1000))
+        self.update_timer.start(int(self.gui_update_interval * 1000))
         
         self.na_item = "N/A"
         self.success_item = "✅ Success"
@@ -141,7 +189,11 @@ class ConforamaGUI(QMainWindow):
         
         self.statusBar().showMessage("Ready")
     
-    def limit_log_lines(self, max_lines: int = config.MAX_LOG_LINES):
+    def limit_log_lines(self, max_lines: int = None):
+        if max_lines is None:
+            # Use platform-specific log limits
+            max_lines = config.MAX_LOG_LINES // 2 if IS_WINDOWS else config.MAX_LOG_LINES
+            
         document = self.log_text.document()
         
         if document.lineCount() > max_lines:
@@ -159,8 +211,17 @@ class ConforamaGUI(QMainWindow):
                 cursor.deletePreviousChar()
     
     def add_log_message(self, message: str):
+        # For large datasets, show logs more selectively but still in real-time
         if self.is_large_dataset:
-            if not any(indicator in message for indicator in ["✅", "🚫", "❌ Error", "🚀", "⏹️", "🎉", "⚙️"]):
+            # Show important messages and some failures for real-time feedback
+            if any(indicator in message for indicator in ["✅", "🚫", "🚀", "⏹️", "🎉", "⚙️"]):
+                # Always show successes, bans, and system messages
+                pass
+            elif "❌" in message and (self.failed_count % 20 == 0 or self.failed_count < 500):
+                # Show every 20th failure for real-time progress indication OR first 500 failures
+                pass
+            else:
+                # Skip routine failure messages to reduce spam
                 return
         
         self.log_entries.append(message)
@@ -364,8 +425,22 @@ class ConforamaGUI(QMainWindow):
         if self.is_large_dataset:
             self.add_log_message(f"🔍 Large dataset detected ({credential_count} accounts) - Enabling memory optimizations")
             
-            config.GUI_UPDATE_BATCH_SIZE = min(50, credential_count // 20)
-            config.GUI_UPDATE_INTERVAL = 0.2
+            # Use reasonable batch sizes that work well on both Windows and Linux
+            if credential_count > 50000:
+                self.gui_update_batch_size = 5  # Moderate batch size for massive datasets
+                self.gui_update_interval = 0.1  # 100ms interval
+                self.add_log_message(f"⚙️ Massive dataset - using batch size: {self.gui_update_batch_size}")
+            elif credential_count > 10000:
+                self.gui_update_batch_size = 8  # Medium batch size for very large datasets
+                self.gui_update_interval = 0.12  # 120ms interval
+                self.add_log_message(f"⚙️ Very large dataset - using batch size: {self.gui_update_batch_size}")
+            else:
+                self.gui_update_batch_size = 10  # Normal batch size for large datasets
+                self.gui_update_interval = 0.15  # 150ms interval
+                self.add_log_message(f"⚙️ Large dataset - using batch size: {self.gui_update_batch_size}")
+            
+            # Force immediate GUI update after setting parameters
+            QApplication.processEvents()
             
             reply = QMessageBox.question(
                 self, 
@@ -373,7 +448,8 @@ class ConforamaGUI(QMainWindow):
                 f"You're about to process {credential_count} accounts.\n\n"
                 f"Large dataset optimizations will be enabled:\n"
                 f"• Reduced logging frequency\n"
-                f"• Larger GUI update batches\n"
+                f"• Larger GUI update batches ({self.gui_update_batch_size} items)\n"
+                f"• Update interval: {self.gui_update_interval}s\n"
                 f"• Memory-efficient processing\n\n"
                 f"Continue?",
                 QMessageBox.Yes | QMessageBox.No,
@@ -400,8 +476,29 @@ class ConforamaGUI(QMainWindow):
         self.failed_count = 0
         self.banned_count = 0
         
+        # Restart timer with new interval if efficient mode is enabled
+        if self.is_large_dataset and hasattr(self, 'update_timer'):
+            self.update_timer.stop()
+            # Use more conservative timer intervals on Windows to prevent CPU spikes
+            if credential_count > 50000:
+                timer_interval = 200 if IS_WINDOWS else 100  # More conservative on Windows
+            else:
+                timer_interval = 250 if IS_WINDOWS else 150  # More conservative on Windows
+            self.update_timer.start(timer_interval)
+            self.add_log_message(f"⚙️ Timer restarted with {timer_interval/1000}s interval")
+            if IS_WINDOWS:
+                self.add_log_message("⚙️ Windows detected - using CPU-friendly timers")
+            self.add_log_message(f"⚙️ Timer active: {self.update_timer.isActive()}")
+        else:
+            self.add_log_message(f"⚙️ Normal mode - using default timer interval")
+        
         max_workers = self.thread_spinbox.value()
-        self.extraction_worker = ExtractionWorker(self.credentials, max_workers)
+        self.extraction_worker = ExtractionWorker(
+            self.credentials, 
+            max_workers, 
+            self.gui_update_batch_size, 
+            self.gui_update_interval
+        )
         self.extraction_worker.progress_updated.connect(self.on_progress_updated)
         self.extraction_worker.batch_progress_updated.connect(self.on_batch_progress_updated)
         self.extraction_worker.extraction_finished.connect(self.on_extraction_finished)
@@ -409,9 +506,18 @@ class ConforamaGUI(QMainWindow):
         self.extraction_worker.startup_progress.connect(self.on_startup_progress)
         self.extraction_worker.start()
         
+        # Force immediate processing of pending events
+        QApplication.processEvents()
+        
         optimization_text = " + memory optimizations" if self.is_large_dataset else ""
         self.add_log_message(f"🚀 Started extraction with {max_workers} threads (optimized startup + batched updates{optimization_text})")
         self.statusBar().showMessage("Initializing optimized extraction...")
+        
+        # Force immediate GUI update
+        if self.is_large_dataset:
+            self.add_log_message("⚙️ Large dataset mode active - initializing...")
+            self.add_log_message(f"⚙️ Will show updates every {self.gui_update_batch_size} results or {self.gui_update_interval}s")
+            QApplication.processEvents()  # Force GUI update
     
     def stop_extraction(self):
         if hasattr(self, 'update_timer'):
@@ -426,8 +532,12 @@ class ConforamaGUI(QMainWindow):
         self.statusBar().showMessage("Extraction stopped")
         self.add_log_message("⏹️ Extraction stopped by user")
         
+        # Reset GUI update settings to default
+        self.gui_update_batch_size = config.GUI_UPDATE_BATCH_SIZE
+        self.gui_update_interval = config.GUI_UPDATE_INTERVAL
+        
         if hasattr(self, 'update_timer'):
-            self.update_timer.start(int(config.GUI_UPDATE_INTERVAL * 1000))
+            self.update_timer.start(int(self.gui_update_interval * 1000))
     
     def write_phone_immediately(self, phone: str):
         try:
@@ -486,6 +596,9 @@ class ConforamaGUI(QMainWindow):
         elif result.banned:
             self.add_log_message(f"🚫 {result.username} -> BANNED (401)")
             self.banned_count += 1
+        elif result.username == "" and result.password == "":
+            # System message - always show
+            self.add_log_message(f"⚙️ {result.error}")
         else:
             self.add_log_message(f"❌ {result.username} -> {result.error}")
             self.failed_count += 1
@@ -496,7 +609,11 @@ class ConforamaGUI(QMainWindow):
             self.results_table.scrollToBottom()
     
     def on_batch_progress_updated(self, batch_results: List, completed: int, total: int):
-        if self.is_large_dataset:
+        # Disable table updates during batch processing on Windows for better performance
+        if IS_WINDOWS and self.is_large_dataset:
+            self.results_table.setUpdatesEnabled(False)
+            self.results_table.setSortingEnabled(False)
+        elif self.is_large_dataset:
             self.results_table.setUpdatesEnabled(False)
             self.results_table.setSortingEnabled(False)
         
@@ -517,7 +634,11 @@ class ConforamaGUI(QMainWindow):
             elif result.banned:
                 self.add_log_message(f"🚫 {result.username} -> BANNED (401)")
                 self.banned_count += 1
+            elif result.username == "" and result.password == "":
+                # System message - always show
+                self.add_log_message(f"⚙️ {result.error}")
             else:
+                # Always call add_log_message - it will handle filtering internally
                 self.add_log_message(f"❌ {result.username} -> {result.error}")
                 self.failed_count += 1
         
@@ -533,9 +654,31 @@ class ConforamaGUI(QMainWindow):
         
         self.update_live_stats(completed, total)
         
-        scroll_frequency = 50 if self.is_large_dataset else 10
+        # Platform-specific scroll frequency optimization
+        if IS_WINDOWS:
+            scroll_frequency = 100 if self.is_large_dataset else 20  # Less frequent on Windows
+        else:
+            scroll_frequency = 50 if self.is_large_dataset else 10   # Standard frequency
+            
         if completed % scroll_frequency == 0 or completed == total:
             self.results_table.scrollToBottom()
+        
+        # Force GUI updates more frequently for real-time logs, but less on Windows
+        if IS_WINDOWS:
+            # On Windows, update GUI less frequently to reduce CPU usage
+            if completed % 100 == 0:  # Every 100 results on Windows
+                QApplication.processEvents()
+        else:
+            # On Linux/other systems, more frequent updates are fine
+            if completed % 25 == 0:  # Every 25 results on Linux
+                QApplication.processEvents()
+        
+        # Show periodic status updates for large datasets
+        if self.is_large_dataset and completed % 2000 == 0:
+            self.add_log_message(f"⚙️ Progress: {completed}/{total} ({(completed/total*100):.1f}% complete)")
+            # Reduce frequency of processEvents calls on Windows to prevent CPU spikes
+            if completed % (8000 if IS_WINDOWS else 4000) == 0:
+                QApplication.processEvents()  # Less frequent GUI updates on Windows
     
     def update_live_stats(self, completed: int, total: int):
         success_rate = (self.successful_count / completed * 100) if completed > 0 else 0
@@ -560,6 +703,10 @@ Success rate: {success_rate:.1f}%
         
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        
+        # Reset GUI update settings to default
+        self.gui_update_batch_size = config.GUI_UPDATE_BATCH_SIZE
+        self.gui_update_interval = config.GUI_UPDATE_INTERVAL
         
         self.results_table.setSortingEnabled(True)
         
@@ -656,6 +803,8 @@ Success rate: {(self.successful_count/total_accounts*100):.1f}%
     def on_startup_progress(self, message: str):
         self.add_log_message(f"⚙️ {message}")
         self.statusBar().showMessage(message)
+        # Force GUI update for startup messages
+        QApplication.processEvents()
     
     def flush_pending_updates(self):
         if hasattr(self, 'extraction_worker') and self.extraction_worker and not self.extraction_worker.is_stopped:

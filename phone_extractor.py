@@ -7,9 +7,13 @@ import threading
 from typing import Optional, Callable, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import platform
 
 from conforama_session import ConforamaSession
 import config
+
+# Detect Windows for CPU optimizations
+IS_WINDOWS = platform.system() == "Windows"
 
 
 class PhoneResult:
@@ -70,40 +74,78 @@ class PhoneExtractor:
         completed_count = 0
         total_count = len(credentials)
         
-        username_to_password = {username: password for username, password in credentials}
+        # Announce start of extraction
+        if self.callback:
+            self.callback(PhoneResult("", "", "", False, "Starting extraction..."), 0, total_count)
         
+        # Start processing immediately with a continuous approach
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_account = {}
+            submitted_count = 0
             
-            for i, (username, password) in enumerate(credentials):
+            # Submit initial batch immediately
+            initial_batch = min(self.max_workers * 3, len(credentials))
+            
+            # Announce task submission
+            if self.callback:
+                self.callback(PhoneResult("", "", "", False, f"Submitting first {initial_batch} tasks..."), 0, total_count)
+            
+            for i in range(initial_batch):
                 if self.stop_event.is_set():
                     break
-                    
+                username, password = credentials[i]
                 future = executor.submit(self.process_single_account, username, password)
-                future_to_account[future] = username
-                
-                if i > 0 and i % 5 == 0:
-                    time.sleep(config.THREAD_STARTUP_DELAY)
+                future_to_account[future] = (username, password, i)
+                submitted_count += 1
             
-            for future in as_completed(future_to_account):
+            # Announce that tasks are running
+            if self.callback:
+                self.callback(PhoneResult("", "", "", False, f"Tasks submitted - awaiting first responses..."), 0, total_count)
+            
+            # Process results as they come and submit more tasks
+            remaining_credentials = credentials[initial_batch:]
+            remaining_index = initial_batch
+            
+            while future_to_account or remaining_credentials:
                 if self.stop_event.is_set():
                     break
-                    
-                username = future_to_account[future]
-                completed_count += 1
                 
-                try:
-                    result = future.result()
+                # Submit more tasks if we have capacity and remaining credentials
+                while len(future_to_account) < self.max_workers * 5 and remaining_credentials:
+                    if self.stop_event.is_set():
+                        break
                     
-                    if self.callback:
-                        self.callback(result, completed_count, total_count)
-                        
-                except Exception as e:
-                    password = username_to_password.get(username, "")
-                    result = PhoneResult(username, password, error=f"Future exception: {str(e)}")
+                    username, password = remaining_credentials.pop(0)
+                    future = executor.submit(self.process_single_account, username, password)
+                    future_to_account[future] = (username, password, remaining_index)
+                    submitted_count += 1
+                    remaining_index += 1
+                
+                # Check for completed futures (non-blocking)
+                completed_futures = []
+                for future in list(future_to_account.keys()):
+                    if future.done():
+                        completed_futures.append(future)
+                
+                # Process completed futures immediately
+                for future in completed_futures:
+                    username, password, _ = future_to_account.pop(future)
+                    completed_count += 1
                     
-                    if self.callback:
-                        self.callback(result, completed_count, total_count)
+                    try:
+                        result = future.result()
+                        if self.callback:
+                            self.callback(result, completed_count, total_count)
+                    except Exception as e:
+                        result = PhoneResult(username, password, error=f"Future exception: {str(e)}")
+                        if self.callback:
+                            self.callback(result, completed_count, total_count)
+                
+                # Small delay to prevent busy waiting (platform-specific optimization)
+                if not completed_futures:
+                    # Windows needs longer delays to prevent high CPU usage
+                    sleep_time = 0.1 if IS_WINDOWS else 0.05
+                    time.sleep(sleep_time)
     
     def stop(self):
         self.stop_event.set()
