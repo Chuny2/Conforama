@@ -2,46 +2,35 @@
 Configuration settings for Conforama Phone Extractor GUI
 """
 
-# HTTP Request Configuration
-HTTP_TIMEOUT = 30.0
-FOLLOW_REDIRECTS = True
-
-# Threading Configuration
 DEFAULT_MAX_WORKERS = 10
-MAX_WORKERS_LIMIT = 100  # Increased limit for high-volume processing
+MAX_WORKERS_LIMIT = 100
 
-# URL Configuration
+HTTP_TIMEOUT = 30.0
+HTTP_CONNECTION_POOL_SIZE = 10
+HTTP_MAX_KEEPALIVE_CONNECTIONS = 5
+HTTP_CONNECT_TIMEOUT = 10.0
+HTTP_READ_TIMEOUT = 20.0
+
+THREAD_STARTUP_DELAY = 0.05
+
+GUI_UPDATE_BATCH_SIZE = 10
+GUI_UPDATE_INTERVAL = 0.1
+
+MAX_LOG_ENTRIES = 1000
+EXPORT_CHUNK_SIZE = 100
+LARGE_DATASET_THRESHOLD = 1000
+MAX_TABLE_ROWS = 5000
+
+MAX_LOG_LINES = 400
+
 BASE_URL = "https://www.conforama.es"
-LOGIN_URL = f"{BASE_URL}/customer/account/login"
-ORDER_HISTORY_URL = f"{BASE_URL}/sales/order/history"
-CUSTOMER_ADDRESS_URL = f"{BASE_URL}/customer/address"
 
-# Headers Configuration
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 ACCEPT_LANGUAGE = "en-US,en;q=0.5"
 ACCEPT_ENCODING = "gzip, deflate, br"
 
-# File Configuration
 DEFAULT_CREDENTIALS_FILE = "read.txt"
-DEFAULT_RESULTS_FILE = "results.txt"
 
-# GUI Configuration
 WINDOW_WIDTH = 1000
 WINDOW_HEIGHT = 700
 WINDOW_TITLE = "Conforama Phone Extractor"
-
-# Phone Number Configuration
-PHONE_PATTERNS = [
-    r'(\+34\s?)?[6-9]\d{8}',       # All Spanish phone formats
-    r'(\+34\s?)?[8-9]\d{8}',       # Spanish landline format
-    r'tel[^>]*>([^<]+)',           # Phone in tel tags
-    r'phone[^>]*>([^<]+)',         # Phone in phone tags
-    r'telefono[^>]*>([^<]+)',      # Spanish phone tags
-    r'móvil[^>]*>([^<]+)',         # Mobile tags
-    r'\b\d{3}[-\s]?\d{3}[-\s]?\d{3}\b',  # Generic 9-digit pattern
-    r'value="([6-9]\d{8})"',       # Phone in input value
-    r'>\s*([6-9]\d{8})\s*<',       # Phone between tags
-]
-
-# Only extract mobile numbers (starting with 6)
-MOBILE_ONLY = True

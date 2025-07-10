@@ -3,16 +3,16 @@ PyQt5 GUI Interface for Conforama Phone Extractor
 """
 
 import sys
-import os
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QPushButton, QTextEdit, 
                             QProgressBar, QSpinBox, QFileDialog, QMessageBox,
-                            QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
+                            QTableWidget, QTableWidgetItem, QTabWidget,
                             QGroupBox, QGridLayout, QLineEdit, QCheckBox)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
-from PyQt5.QtGui import QFont, QIcon, QPixmap
-import threading
+from PyQt5.QtGui import QFont, QTextCursor
 from typing import List
+import time
+import threading
 
 from credential_manager import CredentialManager
 from phone_extractor import PhoneExtractor, PhoneResult
@@ -20,10 +20,11 @@ import config
 
 
 class ExtractionWorker(QThread):
-    """Worker thread for phone extraction"""
-    progress_updated = pyqtSignal(object, int, int)  # result, completed, total
-    extraction_finished = pyqtSignal(list)  # results
-    error_occurred = pyqtSignal(str)  # error message
+    progress_updated = pyqtSignal(object, int, int)
+    batch_progress_updated = pyqtSignal(list, int, int)
+    extraction_finished = pyqtSignal(int)
+    error_occurred = pyqtSignal(str)
+    startup_progress = pyqtSignal(str)
     
     def __init__(self, credentials, max_workers=3):
         super().__init__()
@@ -31,89 +32,153 @@ class ExtractionWorker(QThread):
         self.max_workers = max_workers
         self.extractor = None
         self.is_stopped = False
+        self.total_accounts = len(credentials)
+        
+        self.result_batch = []
+        self.last_update_time = 0
+        self.batch_lock = threading.Lock()
     
     def run(self):
-        """Run the extraction process"""
         try:
-            # Create extractor with callback
+            self.startup_progress.emit("Initializing optimized HTTP clients...")
+            
             self.extractor = PhoneExtractor(
                 max_workers=self.max_workers,
                 callback=self.progress_callback
             )
             
-            # Process accounts
-            results = self.extractor.process_accounts_threaded(self.credentials)
+            self.startup_progress.emit("Starting staggered thread execution...")
+            
+            self.extractor.process_accounts_threaded(self.credentials)
             
             if not self.is_stopped:
-                self.extraction_finished.emit(results)
+                self.extraction_finished.emit(self.total_accounts)
                 
         except Exception as e:
             self.error_occurred.emit(str(e))
     
     def progress_callback(self, result: PhoneResult, completed: int, total: int):
-        """Callback for progress updates"""
-        if not self.is_stopped:
-            self.progress_updated.emit(result, completed, total)
+        if self.is_stopped:
+            return
+            
+        current_time = time.time()
+        
+        with self.batch_lock:
+            self.result_batch.append((result, completed, total))
+            
+            should_update = (
+                len(self.result_batch) >= config.GUI_UPDATE_BATCH_SIZE or
+                current_time - self.last_update_time >= config.GUI_UPDATE_INTERVAL or
+                completed == total
+            )
+            
+            if should_update:
+                batch_copy = self.result_batch.copy()
+                self.result_batch.clear()
+                self.last_update_time = current_time
+                
+                self.batch_progress_updated.emit(batch_copy, completed, total)
     
     def stop(self):
-        """Stop the extraction process"""
         self.is_stopped = True
         if self.extractor:
             self.extractor.stop()
 
 
 class ConforamaGUI(QMainWindow):
-    """Main GUI window for Conforama Phone Extractor"""
     
     def __init__(self):
         super().__init__()
         self.credential_manager = CredentialManager()
         self.extraction_worker = None
-        self.results = []
         self.credentials = []
-        self.phone_buffer = []  # Buffer for batch writing phones
+        
+        self.successful_count = 0
+        self.failed_count = 0
+        self.banned_count = 0
+        
+        self.export_data = []
+        
+        self.pending_table_updates = []
+        self.last_table_update_time = 0
+        
+        self.log_entries = []
+        self.is_large_dataset = False
+        
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self.flush_pending_updates)
+        self.update_timer.start(int(config.GUI_UPDATE_INTERVAL * 1000))
+        
+        self.na_item = "N/A"
+        self.success_item = "✅ Success"
+        self.banned_item = "🚫 BANNED"
+        self.password_masks = {}
         
         self.init_ui()
         self.load_credentials()
     
     def init_ui(self):
-        """Initialize the user interface"""
         self.setWindowTitle(config.WINDOW_TITLE)
         self.setGeometry(100, 100, config.WINDOW_WIDTH, config.WINDOW_HEIGHT)
         
-        # Central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # Create tab widget
         tab_widget = QTabWidget()
         
-        # Main tab
         main_tab = self.create_main_tab()
         tab_widget.addTab(main_tab, "📞 Extractor")
         
-        # Results tab
         results_tab = self.create_results_tab()
         tab_widget.addTab(results_tab, "📊 Results")
         
-        # Settings tab
         settings_tab = self.create_settings_tab()
         tab_widget.addTab(settings_tab, "⚙️ Settings")
         
-        # Main layout
         main_layout = QVBoxLayout()
         main_layout.addWidget(tab_widget)
         central_widget.setLayout(main_layout)
         
-        # Status bar
         self.statusBar().showMessage("Ready")
     
+    def limit_log_lines(self, max_lines: int = config.MAX_LOG_LINES):
+        document = self.log_text.document()
+        
+        if document.lineCount() > max_lines:
+            lines_to_remove = document.lineCount() - max_lines
+            
+            cursor = self.log_text.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            
+            for _ in range(lines_to_remove):
+                cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor)
+            
+            cursor.removeSelectedText()
+            
+            if cursor.position() > 0:
+                cursor.deletePreviousChar()
+    
+    def add_log_message(self, message: str):
+        if self.is_large_dataset:
+            if not any(indicator in message for indicator in ["✅", "🚫", "❌ Error", "🚀", "⏹️", "🎉", "⚙️"]):
+                return
+        
+        self.log_entries.append(message)
+        
+        if len(self.log_entries) > config.MAX_LOG_ENTRIES:
+            self.log_entries = self.log_entries[-config.MAX_LOG_ENTRIES:]
+            
+        self.log_text.append(message)
+        self.limit_log_lines()
+        
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.log_text.setTextCursor(cursor)
+    
     def create_main_tab(self):
-        """Create the main extraction tab"""
         tab = QWidget()
         layout = QVBoxLayout()
         
-        # Title
         title = QLabel("🔍 Conforama Phone Number Extractor")
         title_font = QFont()
         title_font.setPointSize(16)
@@ -122,15 +187,12 @@ class ConforamaGUI(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         
-        # Credentials section
         cred_group = QGroupBox("📝 Credentials")
         cred_layout = QVBoxLayout()
         
-        # Credentials info
         self.cred_info = QLabel("No credentials loaded")
         cred_layout.addWidget(self.cred_info)
         
-        # Load credentials button
         load_cred_btn = QPushButton("📂 Load Credentials File")
         load_cred_btn.clicked.connect(self.load_credentials_file)
         cred_layout.addWidget(load_cred_btn)
@@ -138,11 +200,9 @@ class ConforamaGUI(QMainWindow):
         cred_group.setLayout(cred_layout)
         layout.addWidget(cred_group)
         
-        # Settings section
         settings_group = QGroupBox("⚙️ Extraction Settings")
         settings_layout = QGridLayout()
         
-        # Thread count
         settings_layout.addWidget(QLabel("Threads:"), 0, 0)
         self.thread_spinbox = QSpinBox()
         self.thread_spinbox.setRange(1, config.MAX_WORKERS_LIMIT)
@@ -153,7 +213,6 @@ class ConforamaGUI(QMainWindow):
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
         
-        # Control buttons
         button_layout = QHBoxLayout()
         
         self.start_btn = QPushButton("🚀 Start Extraction")
@@ -169,7 +228,6 @@ class ConforamaGUI(QMainWindow):
         
         layout.addLayout(button_layout)
         
-        # Progress section
         progress_group = QGroupBox("📈 Progress")
         progress_layout = QVBoxLayout()
         
@@ -182,7 +240,6 @@ class ConforamaGUI(QMainWindow):
         progress_group.setLayout(progress_layout)
         layout.addWidget(progress_group)
         
-        # Log section
         log_group = QGroupBox("📋 Log")
         log_layout = QVBoxLayout()
         
@@ -198,11 +255,9 @@ class ConforamaGUI(QMainWindow):
         return tab
     
     def create_results_tab(self):
-        """Create the results tab"""
         tab = QWidget()
         layout = QVBoxLayout()
         
-        # Title
         title = QLabel("📊 Extraction Results")
         title_font = QFont()
         title_font.setPointSize(14)
@@ -210,19 +265,21 @@ class ConforamaGUI(QMainWindow):
         title.setFont(title_font)
         layout.addWidget(title)
         
-        # Results table
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(4)
         self.results_table.setHorizontalHeaderLabels(["Username", "Password", "Phone Number", "Status"])
         self.results_table.horizontalHeader().setStretchLastSection(True)
+        
+        self.results_table.setAlternatingRowColors(True)
+        self.results_table.setSortingEnabled(False)
+        self.results_table.setUpdatesEnabled(True)
+        
         layout.addWidget(self.results_table)
         
-        # Export button
         export_btn = QPushButton("💾 Export Results")
         export_btn.clicked.connect(self.export_results)
         layout.addWidget(export_btn)
         
-        # Statistics
         self.stats_label = QLabel("No results yet")
         layout.addWidget(self.stats_label)
         
@@ -230,11 +287,9 @@ class ConforamaGUI(QMainWindow):
         return tab
     
     def create_settings_tab(self):
-        """Create the settings tab"""
         tab = QWidget()
         layout = QVBoxLayout()
         
-        # Title
         title = QLabel("⚙️ Settings")
         title_font = QFont()
         title_font.setPointSize(14)
@@ -242,7 +297,6 @@ class ConforamaGUI(QMainWindow):
         title.setFont(title_font)
         layout.addWidget(title)
         
-        # Credentials file setting
         cred_group = QGroupBox("📁 Credentials File")
         cred_layout = QGridLayout()
         
@@ -257,32 +311,18 @@ class ConforamaGUI(QMainWindow):
         cred_group.setLayout(cred_layout)
         layout.addWidget(cred_group)
         
-        # Advanced settings
         advanced_group = QGroupBox("🔧 Advanced")
         advanced_layout = QGridLayout()
-        
-        advanced_layout.addWidget(QLabel("Max Workers:"), 0, 0)
-        self.max_workers_spin = QSpinBox()
-        self.max_workers_spin.setRange(1, config.MAX_WORKERS_LIMIT)
-        self.max_workers_spin.setValue(config.DEFAULT_MAX_WORKERS)
-        self.max_workers_spin.setToolTip("Number of concurrent threads. Higher values = faster processing but more server load.\nRecommended: 10-50 for most cases.")
-        advanced_layout.addWidget(self.max_workers_spin, 0, 1)
-        
-        self.mobile_only_check = QCheckBox("Mobile numbers only (6xxxxxxxx)")
-        self.mobile_only_check.setChecked(True)
-        advanced_layout.addWidget(self.mobile_only_check, 1, 0, 1, 2)
         
         advanced_group.setLayout(advanced_layout)
         layout.addWidget(advanced_group)
         
-        # Spacer
         layout.addStretch()
         
         tab.setLayout(layout)
         return tab
     
     def load_credentials(self):
-        """Load credentials from file"""
         try:
             self.credentials = self.credential_manager.get_valid_credentials()
             if self.credentials:
@@ -296,7 +336,6 @@ class ConforamaGUI(QMainWindow):
             self.start_btn.setEnabled(False)
     
     def load_credentials_file(self):
-        """Load credentials from selected file"""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Credentials File", "", "Text Files (*.txt);;All Files (*)"
         )
@@ -307,7 +346,6 @@ class ConforamaGUI(QMainWindow):
             self.load_credentials()
     
     def browse_credentials_file(self):
-        """Browse for credentials file"""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Credentials File", "", "Text Files (*.txt);;All Files (*)"
         )
@@ -316,36 +354,69 @@ class ConforamaGUI(QMainWindow):
             self.cred_file_edit.setText(file_path)
     
     def start_extraction(self):
-        """Start the extraction process"""
         if not self.credentials:
             QMessageBox.warning(self, "Warning", "No credentials loaded!")
             return
         
-        # Update UI
+        credential_count = len(self.credentials)
+        self.is_large_dataset = credential_count > config.LARGE_DATASET_THRESHOLD
+        
+        if self.is_large_dataset:
+            self.add_log_message(f"🔍 Large dataset detected ({credential_count} accounts) - Enabling memory optimizations")
+            
+            config.GUI_UPDATE_BATCH_SIZE = min(50, credential_count // 20)
+            config.GUI_UPDATE_INTERVAL = 0.2
+            
+            reply = QMessageBox.question(
+                self, 
+                "Large Dataset Detected", 
+                f"You're about to process {credential_count} accounts.\n\n"
+                f"Large dataset optimizations will be enabled:\n"
+                f"• Reduced logging frequency\n"
+                f"• Larger GUI update batches\n"
+                f"• Memory-efficient processing\n\n"
+                f"Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.No:
+                return
+        
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.progress_bar.setMaximum(len(self.credentials))
         self.progress_bar.setValue(0)
         self.log_text.clear()
         
-        # Clear results table
         self.results_table.setRowCount(0)
-        self.results = []
-        self.phone_buffer = []  # Clear phone buffer for new session
+        self.results_table.setUpdatesEnabled(True)
+        self.results_table.setSortingEnabled(False)
         
-        # Start worker thread
+        self.export_data = []
+        self.log_entries = []
+        
+        self.successful_count = 0
+        self.failed_count = 0
+        self.banned_count = 0
+        
         max_workers = self.thread_spinbox.value()
         self.extraction_worker = ExtractionWorker(self.credentials, max_workers)
         self.extraction_worker.progress_updated.connect(self.on_progress_updated)
+        self.extraction_worker.batch_progress_updated.connect(self.on_batch_progress_updated)
         self.extraction_worker.extraction_finished.connect(self.on_extraction_finished)
         self.extraction_worker.error_occurred.connect(self.on_error_occurred)
+        self.extraction_worker.startup_progress.connect(self.on_startup_progress)
         self.extraction_worker.start()
         
-        self.log_text.append(f"🚀 Started extraction with {max_workers} threads")
-        self.statusBar().showMessage("Extraction in progress...")
+        optimization_text = " + memory optimizations" if self.is_large_dataset else ""
+        self.add_log_message(f"🚀 Started extraction with {max_workers} threads (optimized startup + batched updates{optimization_text})")
+        self.statusBar().showMessage("Initializing optimized extraction...")
     
     def stop_extraction(self):
-        """Stop the extraction process"""
+        if hasattr(self, 'update_timer'):
+            self.update_timer.stop()
+            
         if self.extraction_worker:
             self.extraction_worker.stop()
             self.extraction_worker.wait()
@@ -353,109 +424,169 @@ class ConforamaGUI(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.statusBar().showMessage("Extraction stopped")
-        self.log_text.append("⏹️ Extraction stopped by user")
+        self.add_log_message("⏹️ Extraction stopped by user")
         
-        # Batch write any phones collected before stopping
-        if self.phone_buffer:
-            self.batch_write_phones()
+        if hasattr(self, 'update_timer'):
+            self.update_timer.start(int(config.GUI_UPDATE_INTERVAL * 1000))
+    
+    def write_phone_immediately(self, phone: str):
+        try:
+            with open("phones.txt", "a", encoding="utf-8") as f:
+                f.write(f"{phone}\n")
+            self.add_log_message(f"📱 Phone {phone} written to phones.txt immediately")
+        except Exception as e:
+            self.add_log_message(f"⚠️ Failed to write phone {phone} to file: {e}")
+    
+    def get_password_mask(self, password_length: int) -> str:
+        if password_length not in self.password_masks:
+            self.password_masks[password_length] = "*" * password_length
+        return self.password_masks[password_length]
+    
+    def add_result_to_table(self, result: PhoneResult):
+        if not result.success and not result.banned and "Login failed" in result.error:
+            return
+        
+        if self.is_large_dataset and self.results_table.rowCount() >= config.MAX_TABLE_ROWS:
+            return
+        
+        if result.success:
+            phone_display = result.phone
+            status_display = self.success_item
+        elif result.banned:
+            phone_display = self.na_item
+            status_display = self.banned_item
+        else:
+            phone_display = self.na_item
+            status_display = f"❌ {result.error}"
+        
+        row_position = self.results_table.rowCount()
+        self.results_table.insertRow(row_position)
+        self.results_table.setItem(row_position, 0, QTableWidgetItem(result.username))
+        self.results_table.setItem(row_position, 1, QTableWidgetItem(self.get_password_mask(len(result.password))))
+        self.results_table.setItem(row_position, 2, QTableWidgetItem(phone_display))
+        self.results_table.setItem(row_position, 3, QTableWidgetItem(status_display))
     
     def on_progress_updated(self, result: PhoneResult, completed: int, total: int):
-        """Handle progress updates"""
         self.progress_bar.setValue(completed)
         self.progress_label.setText(f"Processing {completed}/{total}: {result.username}")
         
-        # Add to results table
-        row = self.results_table.rowCount()
-        self.results_table.insertRow(row)
-        
-        self.results_table.setItem(row, 0, QTableWidgetItem(result.username))
-        self.results_table.setItem(row, 1, QTableWidgetItem("*" * len(result.password)))  # Mask password
+        self.add_result_to_table(result)
         
         if result.success:
-            self.results_table.setItem(row, 2, QTableWidgetItem(result.phone))
-            self.results_table.setItem(row, 3, QTableWidgetItem("✅ Success"))
-            self.log_text.append(f"✅ {result.username} -> {result.phone}")
+            self.add_log_message(f"✅ {result.username} -> {result.phone}")
             
-            # Add phone to buffer for batch writing
-            self.phone_buffer.append(result.phone)
+            self.write_phone_immediately(result.phone)
+            
+            self.export_data.append({
+                'username': result.username,
+                'password': result.password,
+                'phone': result.phone
+            })
+            self.successful_count += 1
         elif result.banned:
-            self.results_table.setItem(row, 2, QTableWidgetItem("N/A"))
-            self.results_table.setItem(row, 3, QTableWidgetItem("🚫 BANNED"))
-            self.log_text.append(f"🚫 {result.username} -> BANNED (401)")
+            self.add_log_message(f"🚫 {result.username} -> BANNED (401)")
+            self.banned_count += 1
         else:
-            self.results_table.setItem(row, 2, QTableWidgetItem("N/A"))
-            self.results_table.setItem(row, 3, QTableWidgetItem(f"❌ {result.error}"))
-            self.log_text.append(f"❌ {result.username} -> {result.error}")
+            self.add_log_message(f"❌ {result.username} -> {result.error}")
+            self.failed_count += 1
         
-        # Update live statistics
         self.update_live_stats(completed, total)
         
-        # Auto-scroll to bottom
-        self.log_text.moveCursor(self.log_text.textCursor().End)
-        self.results_table.scrollToBottom()
+        if completed % 10 == 0 or completed == total:
+            self.results_table.scrollToBottom()
+    
+    def on_batch_progress_updated(self, batch_results: List, completed: int, total: int):
+        if self.is_large_dataset:
+            self.results_table.setUpdatesEnabled(False)
+            self.results_table.setSortingEnabled(False)
+        
+        for result, result_completed, result_total in batch_results:
+            self.add_result_to_table(result)
+            
+            if result.success:
+                self.add_log_message(f"✅ {result.username} -> {result.phone}")
+                
+                self.write_phone_immediately(result.phone)
+                
+                self.export_data.append({
+                    'username': result.username,
+                    'password': result.password,
+                    'phone': result.phone
+                })
+                self.successful_count += 1
+            elif result.banned:
+                self.add_log_message(f"🚫 {result.username} -> BANNED (401)")
+                self.banned_count += 1
+            else:
+                self.add_log_message(f"❌ {result.username} -> {result.error}")
+                self.failed_count += 1
+        
+        if self.is_large_dataset:
+            self.results_table.setUpdatesEnabled(True)
+        
+        self.progress_bar.setValue(completed)
+        
+        if self.is_large_dataset:
+            self.progress_label.setText(f"Processing {completed}/{total} ({(completed/total*100):.1f}% complete)")
+        else:
+            self.progress_label.setText(f"Processing {completed}/{total} (batch of {len(batch_results)} results)")
+        
+        self.update_live_stats(completed, total)
+        
+        scroll_frequency = 50 if self.is_large_dataset else 10
+        if completed % scroll_frequency == 0 or completed == total:
+            self.results_table.scrollToBottom()
     
     def update_live_stats(self, completed: int, total: int):
-        """Update statistics in real-time"""
-        # Count results from table
-        successful = 0
-        failed = 0
-        banned = 0
-        
-        for i in range(self.results_table.rowCount()):
-            status_item = self.results_table.item(i, 3)
-            if status_item:
-                status = status_item.text()
-                if "✅" in status:
-                    successful += 1
-                elif "🚫" in status:
-                    banned += 1
-                else:
-                    failed += 1
-        
-        success_rate = (successful / completed * 100) if completed > 0 else 0
+        success_rate = (self.successful_count / completed * 100) if completed > 0 else 0
         
         stats_text = f"""
 📊 Live Statistics
 Progress: {completed}/{total} ({(completed/total*100):.1f}%)
-✅ Success: {successful}
-❌ Failed: {failed}
-🚫 Banned: {banned}
+✅ Success: {self.successful_count}
+❌ Failed: {self.failed_count}
+🚫 Banned: {self.banned_count}
 Success rate: {success_rate:.1f}%
         """
         
         self.stats_label.setText(stats_text)
     
-    def on_extraction_finished(self, results: List[PhoneResult]):
-        """Handle extraction completion"""
-        self.results = results
+    def on_extraction_finished(self, total_accounts: int):
+        self.flush_pending_updates()
+        
+        if self.is_large_dataset:
+            self.cleanup_memory()
+            self.add_log_message(f"🧹 Final cleanup completed for large dataset ({total_accounts} accounts)")
+        
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         
-        # Update statistics
-        successful = [r for r in results if r.success]
-        failed = [r for r in results if not r.success and not r.banned]
-        banned = [r for r in results if r.banned]
+        self.results_table.setSortingEnabled(True)
         
         stats_text = f"""
 📊 Extraction Complete!
-Total accounts: {len(results)}
-✅ Success: {len(successful)}
-❌ Failed: {len(failed)}
-🚫 Banned: {len(banned)}
-Success rate: {(len(successful)/len(results)*100):.1f}%
+Total accounts: {total_accounts}
+✅ Success: {self.successful_count}
+❌ Failed: {self.failed_count}
+🚫 Banned: {self.banned_count}
+Success rate: {(self.successful_count/total_accounts*100):.1f}%
         """
+        
+        if self.is_large_dataset:
+            stats_text += f"\n🧹 Memory optimizations were active"
         
         self.stats_label.setText(stats_text)
         self.statusBar().showMessage("Extraction completed")
-        self.log_text.append("🎉 Extraction completed!")
+        self.add_log_message("🎉 Extraction completed!")
         
-        # Batch write all phones to file
-        self.batch_write_phones()
+        self.results_table.scrollToBottom()
         
-        # Show completion message
         completion_msg = f"Extraction completed!\n\n" \
-                        f"Found {len(successful)} phone numbers out of {len(results)} accounts.\n" \
-                        f"Banned accounts: {len(banned)}"
+                        f"Found {self.successful_count} phone numbers out of {total_accounts} accounts.\n" \
+                        f"Banned accounts: {self.banned_count}"
+        
+        if self.is_large_dataset:
+            completion_msg += f"\n\nLarge dataset optimizations were used to manage {total_accounts} accounts efficiently."
         
         QMessageBox.information(
             self, 
@@ -463,36 +594,16 @@ Success rate: {(len(successful)/len(results)*100):.1f}%
             completion_msg
         )
     
-    def batch_write_phones(self):
-        """Batch write all collected phone numbers to phones.txt"""
-        if not self.phone_buffer:
-            return
-            
-        try:
-            with open("phones.txt", "a", encoding="utf-8") as f:
-                for phone in self.phone_buffer:
-                    f.write(f"{phone}\n")
-            
-            self.log_text.append(f"📱 Appended {len(self.phone_buffer)} phone numbers to phones.txt")
-            
-        except Exception as e:
-            self.log_text.append(f"⚠️ Failed to save phones to file: {e}")
-            
-        finally:
-            self.phone_buffer.clear()  # Clear buffer after writing
-    
     def on_error_occurred(self, error: str):
-        """Handle errors"""
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.statusBar().showMessage("Error occurred")
-        self.log_text.append(f"❌ Error: {error}")
+        self.add_log_message(f"❌ Error: {error}")
         
         QMessageBox.critical(self, "Error", f"An error occurred:\n{error}")
     
     def export_results(self):
-        """Export results to file"""
-        if not self.results:
+        if not self.export_data:
             QMessageBox.warning(self, "Warning", "No results to export!")
             return
         
@@ -502,36 +613,83 @@ Success rate: {(len(successful)/len(results)*100):.1f}%
         
         if file_path:
             try:
-                successful_results = [r for r in self.results if r.success]
+                total_results = len(self.export_data)
+                
+                progress_dialog = None
+                if total_results > config.EXPORT_CHUNK_SIZE:
+                    progress_dialog = QMessageBox(self)
+                    progress_dialog.setWindowTitle("Exporting Results")
+                    progress_dialog.setText(f"Exporting {total_results} results...")
+                    progress_dialog.setStandardButtons(QMessageBox.NoButton)
+                    progress_dialog.show()
+                    QApplication.processEvents()
                 
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write("Conforama Phone Extraction Results\n")
                     f.write("=" * 40 + "\n\n")
                     
-                    for result in successful_results:
-                        f.write(f"{result.username}:{result.password}:{result.phone}\n")
+                    for i in range(0, total_results, config.EXPORT_CHUNK_SIZE):
+                        chunk = self.export_data[i:i + config.EXPORT_CHUNK_SIZE]
+                        
+                        if progress_dialog:
+                            progress_dialog.setText(f"Exporting {i + len(chunk)}/{total_results} results...")
+                            QApplication.processEvents()
+                        
+                        for item in chunk:
+                            f.write(f"{item['username']}:{item['password']}:{item['phone']}\n")
+                
+                if progress_dialog:
+                    progress_dialog.close()
                 
                 QMessageBox.information(
                     self, 
                     "Export Complete", 
                     f"Results exported to {file_path}\n\n"
-                    f"Exported {len(successful_results)} phone numbers."
+                    f"Exported {len(self.export_data)} phone numbers."
                 )
                 
             except Exception as e:
+                if progress_dialog:
+                    progress_dialog.close()
                 QMessageBox.critical(self, "Export Error", f"Failed to export results:\n{str(e)}")
+    
+    def on_startup_progress(self, message: str):
+        self.add_log_message(f"⚙️ {message}")
+        self.statusBar().showMessage(message)
+    
+    def flush_pending_updates(self):
+        if hasattr(self, 'extraction_worker') and self.extraction_worker and not self.extraction_worker.is_stopped:
+            with self.extraction_worker.batch_lock:
+                if self.extraction_worker.result_batch:
+                    batch_copy = self.extraction_worker.result_batch.copy()
+                    self.extraction_worker.result_batch.clear()
+                    self.extraction_worker.last_update_time = time.time()
+                    
+                    if batch_copy:
+                        last_result, completed, total = batch_copy[-1]
+                        self.on_batch_progress_updated(batch_copy, completed, total)
+        
+        if self.is_large_dataset:
+            self.cleanup_memory()
+    
+    def cleanup_memory(self):
+        if self.is_large_dataset:
+            if len(self.export_data) > config.MAX_LOG_ENTRIES:
+                self.export_data = self.export_data[-config.MAX_LOG_ENTRIES:]
+                self.add_log_message(f"🧹 Memory cleanup: Limited export data to {config.MAX_LOG_ENTRIES} entries")
+            
+            if len(self.log_entries) > config.MAX_LOG_ENTRIES:
+                self.log_entries = self.log_entries[-config.MAX_LOG_ENTRIES//2:]
+                self.add_log_message("🧹 Memory cleanup: Cleared old log entries")
 
 
 def main():
-    """Main function to run the GUI"""
     app = QApplication(sys.argv)
     app.setApplicationName("Conforama Phone Extractor")
     
-    # Create and show the main window
     window = ConforamaGUI()
     window.show()
     
-    # Run the application
     sys.exit(app.exec_())
 
 
